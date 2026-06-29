@@ -83,7 +83,7 @@ def with_retry(max_retries=3, delay=5):
 @with_retry(max_retries=3, delay=5)
 def search_tavily(query: str) -> str:
     """Uses general deep web indexing to catch portfolio updates, not just news."""
-    response = tavily_client.search(query=query, search_depth=1, topic="general")
+    response = tavily_client.search(query=query, search_depth="basic", topic="general")
     results = response.get("results", [])
     return "\n".join([f"Title: {r.get('title')}\nContent: {r.get('content')}" for r in results])
 
