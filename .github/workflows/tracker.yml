@@ -2,40 +2,40 @@ name: Weekly Founder Sourcing Pipeline
 
 on:
   schedule:
-    # 16:30 UTC corresponds exactly to 10:00 PM IST on Monday nights
     - cron: '30 4 * * 1'
-  workflow_dispatch:
+  workflow_dispatch: 
 
 jobs:
   execute-pipeline:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout Source Assets
         uses: actions/checkout@v4
 
       - name: Initialize Environment Manager (uv)
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv-action@v5
 
-      - name: Provision Python Runtime environment
+      - name: Provision Python Runtime Environment
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.12'
 
       - name: Deploy Script Dependency Tree
-        run: uv pip install --system google-genai requests tavily-python
+        # Updated to install groq instead of google-genai
+        run: uv pip install --system groq tavily-python
 
       - name: Orchestrate Pipeline Runtime Execution
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-        run: python script.py
+        run: python tracker.py
 
       - name: Persist Sourcing Report Data
-        if: always() # Forces this step to run even if the python script fails
+        if: always() 
         uses: actions/upload-artifact@v4
         with:
           name: sourcing-intelligence-data
