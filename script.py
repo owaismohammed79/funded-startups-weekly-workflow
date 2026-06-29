@@ -116,7 +116,10 @@ def extract_founder_names(startup: str) -> list:
 def enrich_specific_founder(startup: str, founder_name: str) -> dict:
     """Step 2 of the multi-step logic: Target the specific individual."""
     query = f"{founder_name} {startup} LinkedIn Twitter"
-    raw_intel = search_tavily(query)
+    raw_intel = tavily_client.search(
+        query=f"{founder_name} {startup} founder", 
+        include_domains=["[linkedin.com/in](https://linkedin.com/in)", "twitter.com", "x.com"]
+    )
     
     prompt = f"""
     Parse this data to find the social profiles for '{founder_name}', founder of '{startup}'.
