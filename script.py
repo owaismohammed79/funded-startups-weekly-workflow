@@ -7,12 +7,16 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from groq import Groq
 from tavily import TavilyClient
+import functools
+import logging
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
@@ -34,6 +38,19 @@ FUNDS_TO_TRACK = [
     "First Round Capital"
 ]
 
+def time_execution(func):
+    """Decorator to measure and log the execution time of a function."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        
+        duration = end_time - start_time
+        logging.info(f"Function '{func.__name__}' executed in {duration:.4f} seconds")
+        return result
+    return wrapper
+
 def clean_and_parse_json(raw_text: str):
     cleaned = raw_text.strip()
     cleaned = re.sub(r'<think>.*?</think>', '', cleaned, flags=re.IGNORECASE | re.DOTALL)
@@ -44,7 +61,7 @@ def clean_and_parse_json(raw_text: str):
 
 def save_state_to_json(data: list, filename: str = "sourcing_report.json"):
     with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+        json.dump(data, f, indent=4, ensure_ascii=False)
     print(f"    [💾] State synchronized cleanly to {filename}")
 
 def generate_with_fallback(prompt: str) -> str:
@@ -67,7 +84,7 @@ def generate_with_fallback(prompt: str) -> str:
                     ],
                     model=model,
                     response_format={"type": "json_object"}, 
-                    temperature=0.2
+                    temperature=0.1
                 )
                 return response.choices[0].message.content
             
@@ -131,22 +148,47 @@ def extract_startups(source_name: str, raw_text: str) -> list:
     
     # NEW: Ruthless Temporal and Stage Kill-Switches
     prompt = f"""
-    Analyze this raw tech ecosystem material regarding '{source_name}'.
-    
-    CRITICAL FILTERING RULES:
-    1. TARGET: ONLY extract startups that explicitly raised a Pre-Seed, Seed, or Series A round in 2025 or 2026.
-    2. TIME KILL-SWITCH: If the text mentions the seed/early round happened years ago (e.g., 2020, 2022), EXCLUDE IT immediately.
-    3. MATURITY KILL-SWITCH: If the text mentions the company later raised a Series B, Series C, Growth Round, or was acquired, EXCLUDE IT completely. 
-    
-    Return strictly a JSON object with a single key "startups" containing an array of strings (the names).
-    If no matches survive these rules, return {{"startups": []}}.
-    
-    Data:
-    {raw_text}
-    """
+        Analyze this raw tech ecosystem material regarding '{source_name}'.
+
+        CRITICAL FILTERING RULES:
+        1. ONLY extract startups explicitly stated to have raised Pre-Seed, Seed, or Series A funding recently.
+        2. EXCLUDE companies that raised Series B, Series C, Growth Rounds, or were acquired.
+        3. PROOF REQUIREMENT: You MUST provide a verbatim quote from the text that proves the early-stage funding.
+
+        Return strictly a JSON object formatted exactly like this:
+        {{
+            "startups": [
+                {{
+                    "name": "StartupName",
+                    "evidence_quote": "The exact sentence from the text proving the early-stage round."
+                }}
+            ]
+        }}
+        If no matches exist, return {{"startups": []}}.
+        Data:
+        {raw_text}
+        """
     response_payload = generate_with_fallback(prompt)
     try:
-        return clean_and_parse_json(response_payload).get("startups", [])
+        data = clean_and_parse_json(response_payload)
+        valid_startups = []
+        
+        # Python-level Lie Detector
+        normalized_raw = " ".join(raw_text.split())
+        
+        for item in data.get("startups", []):
+            name = item.get("name")
+            quote = item.get("evidence_quote", "")
+            
+            # Normalize whitespace for flexible matching
+            normalized_quote = " ".join(quote.split())
+            
+            if name and normalized_quote and (normalized_quote in normalized_raw or normalized_quote[:30] in normalized_raw):
+                valid_startups.append(name)
+            else:
+                print(f"        [-] Hallucination intercepted: Destroying unverified data for '{name}'")
+                
+        return valid_startups
     except Exception:
         return []
 
@@ -174,16 +216,20 @@ def enrich_specific_founder(startup: str, founder_name: str) -> dict:
     if not raw_intel:
         return {"founder_name": founder_name, "linkedin": [], "x_handle": []}
         
-    # NEW: Strict /in/ enforcement for LinkedIn profiles
     prompt = f"""
     Parse this data to find the social profiles for '{founder_name}', founder of '{startup}'.
+    
+    CRITICAL VALIDATION RULES:
+    1. IDENTITY CHECK: The URL MUST belong to '{founder_name}'. Do not extract profiles of investors, authors, or random employees mentioned in the text.
+    2. SLUG CHECK: The URL MUST logically resemble their name (e.g., first name, last name, initials).
+    3. SPAM KILL-SWITCH: STRICTLY EXCLUDE any URLs that are search queries, contain '?q=', '/status/', or look like spam.
+    
     Return strictly a JSON object with exactly these keys:
     "founder_name": "{founder_name}",
-    "linkedin": [Array of strings. MUST be user profiles containing 'linkedin.com/in/'. Exclude '/posts/', '/company/', or articles],
+    "linkedin": [Array of strings. MUST contain 'linkedin.com/in/'.],
     "x_handle": [Array of strings containing their actual X/Twitter profile URLs]
     
-    If valid profile URLs are missing, return empty arrays [].
-    
+    If valid, matching profile URLs are missing, return empty arrays [].
     Material:
     {raw_intel}
     """
@@ -193,9 +239,7 @@ def enrich_specific_founder(startup: str, founder_name: str) -> dict:
         if isinstance(data.get("linkedin"), str): data["linkedin"] = [data["linkedin"]]
         if isinstance(data.get("x_handle"), str): data["x_handle"] = [data["x_handle"]]
         
-        # Python-level double check to destroy bad links before saving
-        data["linkedin"] = [link for link in data.get("linkedin", []) if "/in/" in link]
-        
+        data["linkedin"] = [link.strip() for link in data.get("linkedin", []) if "/in/" in link]
         return data
     except Exception:
         return {"founder_name": founder_name, "linkedin": [], "x_handle": []}
@@ -203,11 +247,21 @@ def enrich_specific_founder(startup: str, founder_name: str) -> dict:
 def format_links(links_array: list, label: str) -> str:
     if not links_array or not isinstance(links_array, list): return "N/A"
     clean_links = []
+    
+    # List of toxic URL patterns to instantly drop
+    toxic_patterns = ["/search", "?q=", "/hashtag/", "/status/", "/posts/"]
+    
     for link in links_array:
         if link and isinstance(link, str):
             link = link.strip()
+            
+            # Instantly skip this link if it contains any spam markers
+            if any(toxic in link.lower() for toxic in toxic_patterns):
+                continue
+                
             if link not in ["", "#", "N/A", "Not Found"] and link.startswith("http"):
                 clean_links.append(link)
+                
     if not clean_links: return "N/A"
     return "<br>".join([f"<a href='{url}' target='_blank'>{label} {i+1}</a>" for i, url in enumerate(clean_links)])
 
@@ -244,8 +298,10 @@ def send_report(final_data: list):
     except Exception as e:
         print(f"\n[-] CRITICAL EMAIL FAILURE: {e}")
 
+@time_execution
 def main():
     compiled_intelligence = []
+    processed_startups = set()
     print("[*] Initializing Dynamic Sourcing Pipeline via Groq...")
     
     for fund in FUNDS_TO_TRACK:
@@ -260,6 +316,12 @@ def main():
             print(f"    Filtered Early Stage Startups: {startups}")
             
             for startup in startups:
+                if startup.lower() in processed_startups:
+                    print(f"    [!] Skipping {startup} - Already processed in this run.")
+                    continue
+
+                processed_startups.add(startup.lower())
+                
                 print(f"    [+] Locating founder entities for {startup}...")
                 founder_names = extract_founder_names(startup)
                 
