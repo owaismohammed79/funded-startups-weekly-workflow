@@ -3,12 +3,12 @@ import time
 import json
 import re
 import smtplib
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+
 from groq import Groq
 from tavily import TavilyClient
-import functools
-import logging
 
 try:
     from dotenv import load_dotenv
@@ -16,7 +16,6 @@ try:
 except ImportError:
     pass
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
@@ -24,10 +23,25 @@ SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 
-groq_client = Groq(api_key=GROQ_API_KEY)
-tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+REQUIRED_ENV_VARS = {
+    "TAVILY_API_KEY": TAVILY_API_KEY,
+    "SENDER_EMAIL": SENDER_EMAIL,
+    "SENDER_PASSWORD": SENDER_PASSWORD,
+    "RECEIVER_EMAIL": RECEIVER_EMAIL,
+}
+missing = [name for name, val in REQUIRED_ENV_VARS.items() if not val]
+if missing:
+    raise RuntimeError(
+        f"Missing required environment variable(s): {', '.join(missing)}. "
+        "Set these as GitHub Actions secrets before running."
+    )
+if not GROQ_API_KEY:
+    raise RuntimeError(
+        "GROQ_API_KEY must be set — there is no LLM provider configured otherwise."
+    )
 
-# High-signal institutional funds
+groq_client = Groq(api_key=GROQ_API_KEY)
+
 FUNDS_TO_TRACK = [
     "South Park Commons",
     "Founders Fund",
@@ -35,21 +49,26 @@ FUNDS_TO_TRACK = [
     "Sequoia Capital",
     "Andreessen Horowitz",
     "Lightspeed Venture Partners",
-    "First Round Capital"
+    "First Round Capital",
 ]
 
-def time_execution(func):
-    """Decorator to measure and log the execution time of a function."""
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        start_time = time.perf_counter()
-        result = func(*args, **kwargs)
-        end_time = time.perf_counter()
-        
-        duration = end_time - start_time
-        logging.info(f"Function '{func.__name__}' executed in {duration:.4f} seconds")
-        return result
-    return wrapper
+FUNDING_WINDOW_DAYS = 270
+EXHAUSTED_MODELS = set()
+MAX_NEW_STARTUPS_PER_RUN = 20
+
+STATE_DIR = "data/state"
+LEDGER_PATH = os.path.join(STATE_DIR, "seen_startups.json")
+REPORT_PATH = "sourcing_report.json"
+
+
+MODEL_CASCADE = [
+    ("groq", "llama-3.3-70b-versatile"),
+    ("groq", "openai/gpt-oss-120b"),
+    ("groq", "meta-llama/llama-4-scout-17b-16e-instruct"),
+]
+
+MAX_WAIT_THRESHOLD = 30.0
+
 
 def clean_and_parse_json(raw_text: str):
     cleaned = raw_text.strip()
@@ -59,56 +78,111 @@ def clean_and_parse_json(raw_text: str):
     cleaned = re.sub(r'\s*```$', '', cleaned, flags=re.IGNORECASE)
     return json.loads(cleaned.strip())
 
-def save_state_to_json(data: list, filename: str = "sourcing_report.json"):
+def save_state_to_json(data: list, filename: str = REPORT_PATH):
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
-    print(f"    [💾] State synchronized cleanly to {filename}")
+    print(f"    State synchronized cleanly to {filename}")
+
+
+def dynamic_start_date(days_back: int = FUNDING_WINDOW_DAYS) -> str:
+    """Compute the funding-window start date relative to *today*, so the
+    'recently funded' filter stays accurate no matter when this runs."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+    return cutoff.strftime("%Y-%m-%d")
+
+
+def load_ledger() -> dict:
+    """Cross-run memory: which startups have already been reported, and when.
+    Returns {"seen": {startup_lower: iso_date_first_seen}, "last_run": iso_or_None}.
+    """
+    if not os.path.exists(LEDGER_PATH):
+        return {"seen": {}, "last_run": None}
+    try:
+        with open(LEDGER_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[!] Could not read ledger at {LEDGER_PATH} ({e}); starting fresh.")
+        return {"seen": {}, "last_run": None}
+
+
+def save_ledger(ledger: dict):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    ledger["last_run"] = datetime.now(timezone.utc).isoformat()
+    with open(LEDGER_PATH, "w", encoding="utf-8") as f:
+        json.dump(ledger, f, indent=2, ensure_ascii=False)
+    print(f"     Ledger updated at {LEDGER_PATH} "
+          f"({len(ledger['seen'])} startups tracked total). "
+          "Remember: your workflow must git-commit this file for the "
+          "cross-run memory to persist.")
+
+
+def parse_wait_time(error_str: str) -> float:
+    """Extracts a retry-after style wait time from provider error messages."""
+    time_sec = 0.0
+    m_match = re.search(r'(\d+)m', error_str)
+    s_match = re.search(r'(\d+(?:\.\d+)?)s', error_str)
+    if m_match:
+        time_sec += int(m_match.group(1)) * 60
+    if s_match:
+        time_sec += float(s_match.group(1))
+    return time_sec if time_sec > 0 else 15.0
+
+
+def _call_groq(model: str, prompt: str) -> str:
+    response = groq_client.chat.completions.create(
+        messages=[
+            {"role": "system", "content": "You are a precise data extraction assistant. You must output valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        model=model,
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+    return response.choices[0].message.content
+
 
 def generate_with_fallback(prompt: str) -> str:
-    """Hierarchical fallback structure maximizing high-TPM models first."""
-    model_pool = [
-        "meta-llama/llama-4-scout-17b-16e-instruct", 
-        "openai/gpt-oss-120b",
-        "llama-3.3-70b-versatile"
-    ]
-    max_retries = 3
+    """Tries each (provider, model) in MODEL_CASCADE in order, remembering 
+    globally exhausted models to prevent loop-spam and redundant API hits.
+    """
+    global EXHAUSTED_MODELS
     
-    for model in model_pool:
-        attempt = 0
-        while attempt < max_retries:
-            try:
-                response = groq_client.chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": "You are a data extraction assistant. You must output valid JSON only. Do not include your internal reasoning."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    model=model,
-                    response_format={"type": "json_object"}, 
-                    temperature=0.1
-                )
-                return response.choices[0].message.content
+    for provider, model in MODEL_CASCADE:
+        # Dynamically skip any model that has already thrown a TPD/Daily limit error
+        if model in EXHAUSTED_MODELS:
+            continue
             
+        attempt = 0
+        while attempt < 3:
+            try:
+                text = _call_groq(model, prompt)
+                return text
             except Exception as e:
                 error_str = str(e).lower()
-                
-                if "request too large" in error_str or "tpm" in error_str:
-                    print(f"    [!] Payload exceeds TPM bucket for {model}. Cascading...")
-                    break 
-                
-                if "tpd" in error_str or "per day" in error_str:
-                    print(f"    [!] Groq Daily Token Limit (TPD) hit on {model}. Cascading...")
-                    break 
-                
-                if "429" in error_str or "rate" in error_str:
-                    wait_time = 15 * (attempt + 1)
-                    print(f"    [⏳] Groq Rolling Limit Hit on {model}. Backing off {wait_time}s...")
-                    time.sleep(wait_time)
-                    attempt += 1
-                    continue
-                
-                print(f"    [!] Internal API Exception on {model}: {e}")
-                break  
-                
+
+                if "request too large" in error_str or ("tpm" in error_str and "per day" not in error_str):
+                    print(f"    [!] Payload too large for {provider}/{model}. Cascading...")
+                    break
+
+                if "tpd" in error_str or "per day" in error_str or "resource_exhausted" in error_str and "day" in error_str:
+                    print(f"    [!] Daily limits exhausted on {provider}/{model}. Blacklisting model globally...")
+                    EXHAUSTED_MODELS.add(model) # Lock the model out for the rest of the script run
+                    break
+
+                if "429" in error_str or "rate" in error_str or "resource_exhausted" in error_str:
+                    wait_time = parse_wait_time(error_str)
+                    if wait_time > MAX_WAIT_THRESHOLD:
+                        print(f"    [!] Rate limited on {provider}/{model}. Wait is {wait_time}s. Cascading immediately...")
+                        break
+                    else:
+                        print(f"    Rate limited on {provider}/{model}. Waiting {wait_time}s...")
+                        time.sleep(wait_time + 1)
+                        attempt += 1
+                        continue
+
+                print(f"    [!] {provider}/{model} failed: {e}. Cascading...")
+                break
+    print("     All models in cascade exhausted or failed for this prompt.")
     return "{}"
 
 def with_retry(max_retries=3, delay=5):
@@ -119,83 +193,106 @@ def with_retry(max_retries=3, delay=5):
                     return func(*args, **kwargs)
                 except Exception as e:
                     if attempt == max_retries - 1:
-                        print(f"[-] Permanent operational blowout in '{func.__name__}': {e}")
+                        print(f"    [!] {func.__name__} failed after {max_retries} attempts: {e}")
                         return None
-                    print(f"[!] Network error encountered in '{func.__name__}'. Retrying in {delay}s...")
                     time.sleep(delay)
         return wrapper
     return decorator
 
 @with_retry(max_retries=3, delay=3)
-def search_tavily_social(query: str) -> str:
-    response = tavily_client.search(
-        query=query, 
-        search_depth="basic",
-        include_domains=["linkedin.com", "twitter.com", "x.com"],
-        max_results=5
-    )
+def search_tavily_general(query: str, start_date: str = None, search_depth: str = "advanced",  max_results: int = 3) -> str:
+    params = {"query": query, "search_depth": search_depth, "max_results": max_results}
+    if start_date:
+        params["start_date"] = start_date
+    response = tavily_client.search(**params)
     results = response.get("results", [])
-    return "\n---\n".join([f"URL: {r.get('url', 'Unknown')}\nContent: {r.get('content', '')}" for r in results])
+    return "\n---\n".join(
+        f"Title: {r.get('title', 'Unknown')}\nURL: {r.get('url', '')}\nContent: {r.get('content', '')}"
+        for r in results
+    )
+
+
+@with_retry(max_retries=3, delay=3)
+def search_tavily_social(query: str, include_domains=None, search_depth: str = "advanced", max_results: int = 5) -> str:
+    params = {
+        "query": query,
+        "search_depth": search_depth,
+        "max_results": max_results,
+    }
+    if include_domains:
+        params["include_domains"] = include_domains
+    response = tavily_client.search(**params)
+    results = response.get("results", [])
+    return "\n---\n".join(f"URL: {r.get('url', 'Unknown')}\nContent: {r.get('content', '')}" for r in results)
+
+
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+
 
 def extract_startups(source_name: str, raw_text: str) -> list:
-    if not raw_text or not raw_text.strip(): return []
-    
-    # NEW: Ruthless Temporal and Stage Kill-Switches
+    if not raw_text or not raw_text.strip():
+        return []
+
     prompt = f"""
-        Analyze this raw tech ecosystem material regarding '{source_name}'.
+    Analyze this raw tech ecosystem material regarding '{source_name}'.
 
-        CRITICAL FILTERING RULES:
-        1. ONLY extract startups explicitly stated to have raised Pre-Seed, Seed, or Series A funding recently.
-        2. EXCLUDE companies that raised Series B, Series C, Growth Rounds, or were acquired.
-        3. PROOF REQUIREMENT: You MUST provide a verbatim quote from the text that proves the early-stage funding.
+    CRITICAL FILTERING RULES:
+    1. ONLY extract startups where the text indicates the Pre-Seed, Seed, or Series A round is the CURRENT or most recent state of the business within the given timeline.
+    2. TIMELINE ANCHOR: The round must be a current announcement. EXCLUDE historical context bios tracking old achievements of now-famous companies.
+    3. CORPORATE MATURITY KILL-SWITCH: STRICTLY EXCLUDE well-known tech giants, public corporations, unicorns, or market leaders (e.g., Elastic, Elasticsearch, Clay, Harvey, Sierra, Temporal), even if the text mentions their historical early-stage rounds.
+    4. PROOF REQUIREMENT: You MUST provide a verbatim quote from the text that proves the early-stage funding event.
 
-        Return strictly a JSON object formatted exactly like this:
-        {{
-            "startups": [
-                {{
-                    "name": "StartupName",
-                    "evidence_quote": "The exact sentence from the text proving the early-stage round."
-                }}
-            ]
-        }}
-        If no matches exist, return {{"startups": []}}.
-        Data:
-        {raw_text}
-        """
+    Return strictly a JSON object formatted exactly like this:
+    {{
+        "startups": [
+            {{
+                "name": "StartupName",
+                "evidence_quote": "The exact sentence from the text proving the early-stage round."
+            }}
+        ]
+    }}
+    If no matches survive these constraints, return {{"startups": []}}.
+    Data:
+    {raw_text}
+    """
     response_payload = generate_with_fallback(prompt)
     try:
         data = clean_and_parse_json(response_payload)
         valid_startups = []
-        
-        # Python-level Lie Detector
         normalized_raw = " ".join(raw_text.split())
-        
+
         for item in data.get("startups", []):
             name = item.get("name")
             quote = item.get("evidence_quote", "")
-            
-            # Normalize whitespace for flexible matching
             normalized_quote = " ".join(quote.split())
-            
-            if name and normalized_quote and (normalized_quote in normalized_raw or normalized_quote[:30] in normalized_raw):
+
+            if name and normalized_quote and (
+                normalized_quote in normalized_raw or normalized_quote[:30] in normalized_raw
+            ):
                 valid_startups.append(name)
             else:
                 print(f"        [-] Hallucination intercepted: Destroying unverified data for '{name}'")
-                
+
         return valid_startups
     except Exception:
         return []
 
-def extract_founder_names(startup: str) -> list:
-    query = f"'{startup}' startup founders"
-    raw_intel = search_tavily_general(query)
-    if not raw_intel: return []
-    
+def extract_founder_names(startup: str, fund: str) -> list:
+    primary_query = f'"{startup}" company founder'
+    raw_intel = search_tavily_general(primary_query, search_depth="advanced", max_results=6)
+
+    if not raw_intel or not raw_intel.strip():
+        fallback_query = f'"{startup}" startup funded "{fund}" founder co-founder'
+        print(f"        [~] Primary founder search empty for '{startup}'. Retrying with fund context...")
+        raw_intel = search_tavily_general(fallback_query, search_depth="advanced", max_results=6)
+
+    if not raw_intel:
+        return []
+
     prompt = f"""
     Extract the names of the founders for the startup '{startup}'.
     Return strictly a JSON object with a single key "founders" containing an array of strings (their names).
     If no names are found, return {{"founders": []}}.
-    
     Data: {raw_intel}
     """
     response_payload = generate_with_fallback(prompt)
@@ -205,75 +302,75 @@ def extract_founder_names(startup: str) -> list:
         return []
 
 def enrich_specific_founder(startup: str, founder_name: str) -> dict:
-    query = f"{founder_name} {startup} LinkedIn Twitter"
-    raw_intel = search_tavily_social(query)
+    query = f'"{founder_name}" "{startup}" LinkedIn Twitter X profile'
+    raw_intel = search_tavily_social(
+        query,
+        include_domains=["linkedin.com", "twitter.com", "x.com"],
+        search_depth="advanced",
+        max_results=5,
+    )
+
     if not raw_intel:
         return {"founder_name": founder_name, "linkedin": [], "x_handle": []}
-        
+
     prompt = f"""
     Parse this data to find the social profiles for '{founder_name}', founder of '{startup}'.
-    
-    CRITICAL VALIDATION RULES:
-    1. IDENTITY CHECK: The URL MUST belong to '{founder_name}'. Do not extract profiles of investors, authors, or random employees mentioned in the text.
-    2. SLUG CHECK: The URL MUST logically resemble their name (e.g., first name, last name, initials).
-    3. SPAM KILL-SWITCH: STRICTLY EXCLUDE any URLs that are search queries, contain '?q=', '/status/', or look like spam.
-    
     Return strictly a JSON object with exactly these keys:
     "founder_name": "{founder_name}",
-    "linkedin": [Array of strings. MUST contain 'linkedin.com/in/'.],
+    "linkedin": [Array of strings containing their actual LinkedIn URLs from the data],
     "x_handle": [Array of strings containing their actual X/Twitter profile URLs]
-    
-    If valid, matching profile URLs are missing, return empty arrays [].
+
+    Only include a URL if the surrounding text in the data ties it to '{founder_name}' specifically —
+    do not include profiles belonging to other people who share a similar name.
+    If valid profile URLs are missing, return empty arrays [].
     Material:
     {raw_intel}
     """
     response_payload = generate_with_fallback(prompt)
     try:
         data = clean_and_parse_json(response_payload)
-        if isinstance(data.get("linkedin"), str): data["linkedin"] = [data["linkedin"]]
-        if isinstance(data.get("x_handle"), str): data["x_handle"] = [data["x_handle"]]
-        
-        data["linkedin"] = [link.strip() for link in data.get("linkedin", []) if "/in/" in link]
+        if isinstance(data.get("linkedin"), str):
+            data["linkedin"] = [data["linkedin"]]
+        if isinstance(data.get("x_handle"), str):
+            data["x_handle"] = [data["x_handle"]]
         return data
     except Exception:
         return {"founder_name": founder_name, "linkedin": [], "x_handle": []}
 
 def format_links(links_array: list, label: str) -> str:
-    if not links_array or not isinstance(links_array, list): return "N/A"
+    if not links_array or not isinstance(links_array, list):
+        return "N/A"
     clean_links = []
-    
-    # List of toxic URL patterns to instantly drop
     toxic_patterns = ["/search", "?q=", "/hashtag/", "/status/", "/posts/"]
-    
+
     for link in links_array:
         if link and isinstance(link, str):
             link = link.strip()
-            
-            # Instantly skip this link if it contains any spam markers
             if any(toxic in link.lower() for toxic in toxic_patterns):
                 continue
-                
             if link not in ["", "#", "N/A", "Not Found"] and link.startswith("http"):
                 clean_links.append(link)
-                
-    if not clean_links: return "N/A"
-    return "<br>".join([f"<a href='{url}' target='_blank'>{label} {i+1}</a>" for i, url in enumerate(clean_links)])
+
+    if not clean_links:
+        return "N/A"
+    return "<br>".join(f"<a href='{url}' target='_blank'>{label} {i+1}</a>" for i, url in enumerate(clean_links))
+
 
 def send_report(final_data: list):
     if not final_data:
-        print("[*] Sourcing engine returned zero early-stage entities for this window.")
+        print("[*] Sourcing engine returned zero NEW early-stage entities for this window.")
         return
-        
-    html = "<h2>Weekly Sourcing Report (High-Signal Early Stage Founders)</h2><table border='1' cellpadding='10' style='border-collapse: collapse;'>"
+
+    html = "<h2>Weekly Sourcing Report (Verified Early Stage Founders)</h2><table border='1' cellpadding='10' style='border-collapse: collapse;'>"
     html += "<tr><th>Source Context</th><th>Startup</th><th>Founders</th><th>LinkedIn Profiles</th><th>X Handles</th></tr>"
-    
+
     for entry in final_data:
         names_list = entry.get("founder_names", [])
         founder_names_str = ", ".join(names_list) if names_list else "N/A"
-        
+
         linkedin_html = format_links(entry.get("linkedin", []), "LinkedIn")
         x_html = format_links(entry.get("x_handle", []), "X Profile")
-        
+
         html += f"<tr><td>{entry['fund']}</td><td>{entry['startup']}</td><td>{founder_names_str}</td>"
         html += f"<td>{linkedin_html}</td><td>{x_html}</td></tr>"
     html += "</table>"
@@ -283,7 +380,7 @@ def send_report(final_data: list):
     msg["From"] = SENDER_EMAIL
     msg["To"] = RECEIVER_EMAIL
     msg.attach(MIMEText(html, "html"))
-    
+
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
@@ -292,77 +389,88 @@ def send_report(final_data: list):
     except Exception as e:
         print(f"\n[-] CRITICAL EMAIL FAILURE: {e}")
 
-@time_execution
 def main():
-    compiled_intelligence = []
-    processed_startups = set()
-    print("[*] Initializing Dynamic Sourcing Pipeline via Groq...")
-    
-    for fund in FUNDS_TO_TRACK:
-        search_query = f"{fund} early stage funding announced pre-seed seed series A"
-        print(f"\n-> Fetching high-signal portfolio indicators for {fund}...")
-        
-        # We pass the date restriction deterministically to the API itself
-        response = tavily_client.search(
-            query=search_query, 
-            search_depth="basic", 
-            max_results=5,
-            start_date="2025-01-01" # Restricts to the last ~18 months natively
-        )
-        
-        # Re-format the results for the LLM
-        results = response.get("results", [])
-        raw_news = "\n---\n".join([f"Title: {r.get('title', 'Unknown')}\nContent: {r.get('content', '')}" for r in results])
-        
-        if raw_news:
-            startups = extract_startups(fund, raw_news)
-            print(f"    Filtered Early Stage Startups: {startups}")
-            
-            for startup in startups:
-                if startup.lower() in processed_startups:
-                    print(f"    [!] Skipping {startup} - Already processed in this run.")
-                    continue
+    print(f"[*] Initializing Grounded Sourcing Pipeline. "
+          f"Cascade order: {[f'{p}/{m}' for p, m in MODEL_CASCADE]}")
 
-                processed_startups.add(startup.lower())
-                
-                print(f"    [+] Locating founder entities for {startup}...")
-                founder_names = extract_founder_names(startup)
-                
-                if not founder_names:
-                    print(f"        [-] No explicit founder names extracted for {startup}.")
-                    compiled_intelligence.append({
-                        "fund": fund, 
-                        "startup": startup, 
-                        "founder_names": ["N/A"], 
-                        "linkedin": [], 
-                        "x_handle": []
-                    })
-                    continue
-                
-                startup_record = {
+    ledger = load_ledger()
+    seen = ledger["seen"]
+    start_date = dynamic_start_date()
+    print(f"[*] Funding window start date (dynamic, {FUNDING_WINDOW_DAYS}d back): {start_date}")
+
+    compiled_intelligence = []
+    newly_seen_this_run = set()
+
+    for fund in FUNDS_TO_TRACK:
+        if len(compiled_intelligence) >= MAX_NEW_STARTUPS_PER_RUN:
+            print(f"[*] Reached MAX_NEW_STARTUPS_PER_RUN ({MAX_NEW_STARTUPS_PER_RUN}). Stopping fund scan.")
+            break
+
+        search_query = f"{fund} early stage funding announced pre-seed seed series A 2026"
+        print(f"\n-> Fetching high-signal portfolio indicators for {fund}...")
+
+        raw_news = search_tavily_general(search_query, start_date=start_date)
+        if not raw_news:
+            continue
+
+        startups = extract_startups(fund, raw_news)
+        print(f"    Verified Early Stage Startups: {startups}")
+
+        for index, startup in enumerate(startups):
+            if len(compiled_intelligence) >= MAX_NEW_STARTUPS_PER_RUN or index >= 3:
+                break
+
+            key = startup.lower()
+            if key in seen:
+                print(f"    [!] Skipping {startup} - already reported on {seen[key]}.")
+                continue
+            if key in newly_seen_this_run:
+                continue
+
+            newly_seen_this_run.add(key)
+            print(f"    [+] Locating founder entities for {startup}...")
+            founder_names = extract_founder_names(startup, fund)
+
+            if not founder_names:
+                print(f"        [-] No explicit founder names extracted for {startup}.")
+                compiled_intelligence.append({
                     "fund": fund,
                     "startup": startup,
-                    "founder_names": [],
+                    "founder_names": ["N/A"],
                     "linkedin": [],
-                    "x_handle": []
-                }
-                
-                for name in founder_names:
-                    print(f"        [+] Extracting targeted URLs for {name}...")
-                    founder_profile = enrich_specific_founder(startup, name)
-                    
-                    startup_record["founder_names"].append(founder_profile.get("founder_name", name))
-                    startup_record["linkedin"].extend(founder_profile.get("linkedin", []))
-                    startup_record["x_handle"].extend(founder_profile.get("x_handle", []))
-                
-                compiled_intelligence.append(startup_record)
-                save_state_to_json(compiled_intelligence)
-                
-                # Dynamic pacing to prevent hitting rolling minute rate limits
-                time.sleep(4) 
-                
+                    "x_handle": [],
+                })
+                continue
+
+            startup_record = {
+                "fund": fund,
+                "startup": startup,
+                "founder_names": [],
+                "linkedin": [],
+                "x_handle": [],
+            }
+
+            for name in founder_names:
+                print(f"        [+] Extracting targeted URLs for {name}...")
+                founder_profile = enrich_specific_founder(startup, name)
+                startup_record["founder_names"].append(founder_profile.get("founder_name", name))
+                startup_record["linkedin"].extend(founder_profile.get("linkedin", []))
+                startup_record["x_handle"].extend(founder_profile.get("x_handle", []))
+                time.sleep(4)  # keep LLM calls under Groq's free-tier RPM caps
+
+            compiled_intelligence.append(startup_record)
+            save_state_to_json(compiled_intelligence)
+            time.sleep(3)
+
+    # Update the cross-run ledger with everything reported this run.
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    for entry in compiled_intelligence:
+        seen[entry["startup"].lower()] = today_iso
+    save_ledger(ledger)
+
     send_report(compiled_intelligence)
-    print("\n[+] Target pipeline run finalized.")
+    print(f"\n[+] Target pipeline run finalized. {len(compiled_intelligence)} new startup(s) reported.")
+
 
 if __name__ == "__main__":
     main()
