@@ -127,12 +127,6 @@ def with_retry(max_retries=3, delay=5):
     return decorator
 
 @with_retry(max_retries=3, delay=3)
-def search_tavily_general(query: str) -> str:
-    response = tavily_client.search(query=query, search_depth="basic", max_results=10)
-    results = response.get("results", [])
-    return "\n---\n".join([f"Title: {r.get('title', 'Unknown')}\nContent: {r.get('content', '')}" for r in results])
-
-@with_retry(max_retries=3, delay=3)
 def search_tavily_social(query: str) -> str:
     response = tavily_client.search(
         query=query, 
@@ -305,11 +299,20 @@ def main():
     print("[*] Initializing Dynamic Sourcing Pipeline via Groq...")
     
     for fund in FUNDS_TO_TRACK:
-        # Query-Level Filter: Enforcing the stage parameter right at the search level to choke off historical data bloat
-        # Forces the search engine to prioritize current-year announcements
-        search_query = f'"{fund}" ("pre-seed" OR "seed" OR "series A") funding announced 2026'
+        search_query = f"{fund} early stage funding announced pre-seed seed series A"
         print(f"\n-> Fetching high-signal portfolio indicators for {fund}...")
-        raw_news = search_tavily_general(search_query)
+        
+        # We pass the date restriction deterministically to the API itself
+        response = tavily_client.search(
+            query=search_query, 
+            search_depth="basic", 
+            max_results=5,
+            start_date="2025-01-01" # Restricts to the last ~18 months natively
+        )
+        
+        # Re-format the results for the LLM
+        results = response.get("results", [])
+        raw_news = "\n---\n".join([f"Title: {r.get('title', 'Unknown')}\nContent: {r.get('content', '')}" for r in results])
         
         if raw_news:
             startups = extract_startups(fund, raw_news)
