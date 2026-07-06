@@ -14,7 +14,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Initialize Environment Manager (uv)
-        uses: astral-sh/setup-uv-action@v5
+        uses: astral-sh/setup-uv@v5
 
       - name: Provision Python Runtime Environment
         uses: actions/setup-python@v5
