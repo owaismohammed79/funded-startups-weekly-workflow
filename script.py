@@ -384,6 +384,34 @@ def fetch_form_subscribers() -> list:
     except Exception as e:
         print(f"[-] Failed to fetch subscribers from Google Sheets: {e}")
         return []
+    
+def cache_latest_report_in_sheet(html_content: str):
+    creds_file = "credentials.json"
+    if not os.path.exists(creds_file):
+        print(f"    [-] Error: '{creds_file}' missing. Cannot update sheet cache.")
+        return
+
+    if not SPREADSHEET_ID:
+        print("    [-] Error: SPREADSHEET_ID env var is missing.")
+        return
+
+    try:
+        gc = gspread.service_account(filename=creds_file)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        
+        try:
+            worksheet = sh.worksheet("LatestReport")
+        except gspread.WorksheetNotFound:
+            worksheet = sh.add_worksheet(title="LatestReport", rows="5", cols="2")
+
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        
+        worksheet.clear()
+        worksheet.update(range_name='A1', values=[[today_str]])
+        worksheet.update(range_name='A2', values=[[html_content]])
+        print(f"    [+] Successfully cached latest report HTML in Google Sheet! ({today_str})")
+    except Exception as e:
+        print(f"    [-] Failed to cache report in Sheet: {e}")
 
 
 def send_report(final_data: list):
@@ -413,6 +441,8 @@ def send_report(final_data: list):
         table_html += f"<tr><td>{entry['fund']}</td><td>{entry['startup']}</td><td>{founder_names_str}</td>"
         table_html += f"<td>{linkedin_html}</td><td>{x_html}</td></tr>"
     table_html += "</table>"
+
+    cache_latest_report_in_sheet(table_html)
 
     url = "https://api.brevo.com/v3/smtp/email"
     headers = {
