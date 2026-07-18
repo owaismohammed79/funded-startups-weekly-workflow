@@ -2,11 +2,8 @@ import os
 import time
 import json
 import re
-import smtplib
 import requests
 from datetime import datetime, timedelta, timezone
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 import gspread
 from groq import Groq
@@ -18,16 +15,17 @@ try:
 except ImportError:
     pass
 
-
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")   
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 
 REQUIRED_ENV_VARS = {
     "TAVILY_API_KEY": TAVILY_API_KEY,
+    "GROQ_API_KEY": GROQ_API_KEY,
+    "BREVO_API_KEY": BREVO_API_KEY,
     "SENDER_EMAIL": SENDER_EMAIL,
     "SPREADSHEET_ID": SPREADSHEET_ID,
 }
@@ -37,12 +35,9 @@ if missing:
         f"Missing required environment variable(s): {', '.join(missing)}. "
         "Set these as GitHub Actions secrets before running."
     )
-if not GROQ_API_KEY:
-    raise RuntimeError(
-        "GROQ_API_KEY must be set — there is no LLM provider configured otherwise."
-    )
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
 FUNDS_TO_TRACK = [
     "South Park Commons",
@@ -69,6 +64,13 @@ MODEL_CASCADE = [
 ]
 
 MAX_WAIT_THRESHOLD = 30.0
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    return " ".join(text.split())
 
 
 def clean_and_parse_json(raw_text: str):
@@ -106,7 +108,7 @@ def save_ledger(ledger: dict):
     ledger["last_run"] = datetime.now(timezone.utc).isoformat()
     with open(LEDGER_PATH, "w", encoding="utf-8") as f:
         json.dump(ledger, f, indent=2, ensure_ascii=False)
-    print(f"     Ledger updated at {LEDGER_PATH} "
+    print(f"    Ledger updated at {LEDGER_PATH} "
           f"({len(ledger['seen'])} startups tracked total).")
 
 
@@ -171,7 +173,7 @@ def generate_with_fallback(prompt: str) -> str:
 
                 print(f"    [!] {provider}/{model} failed: {e}. Cascading...")
                 break
-    print("     All models in cascade exhausted or failed for this prompt.")
+    print("    All models in cascade exhausted or failed for this prompt.")
     return "{}"
 
 def with_retry(max_retries=3, delay=5):
@@ -215,9 +217,6 @@ def search_tavily_social(query: str, include_domains=None, search_depth: str = "
     return "\n---\n".join(f"URL: {r.get('url', 'Unknown')}\nContent: {r.get('content', '')}" for r in results)
 
 
-tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-
-
 def extract_startups(source_name: str, raw_text: str) -> list:
     if not raw_text or not raw_text.strip():
         return []
@@ -248,12 +247,12 @@ def extract_startups(source_name: str, raw_text: str) -> list:
     try:
         data = clean_and_parse_json(response_payload)
         valid_startups = []
-        normalized_raw = " ".join(raw_text.split())
+        normalized_raw = normalize_text(raw_text)
 
         for item in data.get("startups", []):
             name = item.get("name")
             quote = item.get("evidence_quote", "")
-            normalized_quote = " ".join(quote.split())
+            normalized_quote = normalize_text(quote)
 
             if name and normalized_quote and (
                 normalized_quote in normalized_raw or normalized_quote[:30] in normalized_raw
@@ -346,9 +345,7 @@ def format_links(links_array: list, label: str) -> str:
 
 
 def fetch_form_subscribers() -> list:
-    """Connects to Google Sheets via gspread and extracts unique subscriber emails and names."""
     try:
-        # Check for service account json file
         creds_file = "credentials.json"
         if not os.path.exists(creds_file):
             print(f"[-] Service account credentials file '{creds_file}' not found.")
@@ -384,7 +381,7 @@ def fetch_form_subscribers() -> list:
     except Exception as e:
         print(f"[-] Failed to fetch subscribers from Google Sheets: {e}")
         return []
-    
+
 def cache_latest_report_in_sheet(html_content: str):
     creds_file = "credentials.json"
     if not os.path.exists(creds_file):
@@ -444,7 +441,7 @@ def send_report(final_data: list):
 
     cache_latest_report_in_sheet(table_html)
 
-    url = "https://api.brevo.com/v3/smtp/email"
+    url = "[https://api.brevo.com/v3/smtp/email](https://api.brevo.com/v3/smtp/email)"
     headers = {
         "accept": "application/json",
         "api-key": BREVO_API_KEY,
@@ -526,6 +523,7 @@ def main():
                     "linkedin": [],
                     "x_handle": [],
                 })
+                save_state_to_json(compiled_intelligence)
                 continue
 
             startup_record = {
