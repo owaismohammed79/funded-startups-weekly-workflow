@@ -24,7 +24,11 @@ jobs:
           python-version: "3.12"
 
       - name: Deploy Script Dependency Tree
-        run: uv pip install --system groq tavily-python
+        run: uv pip install --system groq tavily-python gspread requests
+
+      - name: Create Google Service Account Key
+        run: |
+          echo '${{ secrets.GCP_SA_KEY }}' > credentials.json
 
       - name: Orchestrate Pipeline Runtime Execution
         env:
@@ -33,7 +37,12 @@ jobs:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: python script.py
+
+      - name: Delete Service Account Key
+        if: always()
+        run: rm -f credentials.json
 
       - name: Persist Sourcing Report Data
         if: always()

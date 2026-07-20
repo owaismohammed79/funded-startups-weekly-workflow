@@ -3,10 +3,12 @@ import time
 import json
 import re
 import smtplib
+import requests
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+import gspread
 from groq import Groq
 from tavily import TavilyClient
 
@@ -19,15 +21,15 @@ except ImportError:
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
-SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")   
 
 REQUIRED_ENV_VARS = {
     "TAVILY_API_KEY": TAVILY_API_KEY,
     "SENDER_EMAIL": SENDER_EMAIL,
-    "SENDER_PASSWORD": SENDER_PASSWORD,
-    "RECEIVER_EMAIL": RECEIVER_EMAIL,
+    "SPREADSHEET_ID": SPREADSHEET_ID,
 }
 missing = [name for name, val in REQUIRED_ENV_VARS.items() if not val]
 if missing:
@@ -60,7 +62,6 @@ STATE_DIR = "data/state"
 LEDGER_PATH = os.path.join(STATE_DIR, "seen_startups.json")
 REPORT_PATH = "sourcing_report.json"
 
-
 MODEL_CASCADE = [
     ("groq", "llama-3.3-70b-versatile"),
     ("groq", "openai/gpt-oss-120b"),
@@ -85,16 +86,11 @@ def save_state_to_json(data: list, filename: str = REPORT_PATH):
 
 
 def dynamic_start_date(days_back: int = FUNDING_WINDOW_DAYS) -> str:
-    """Compute the funding-window start date relative to *today*, so the
-    'recently funded' filter stays accurate no matter when this runs."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
     return cutoff.strftime("%Y-%m-%d")
 
 
 def load_ledger() -> dict:
-    """Cross-run memory: which startups have already been reported, and when.
-    Returns {"seen": {startup_lower: iso_date_first_seen}, "last_run": iso_or_None}.
-    """
     if not os.path.exists(LEDGER_PATH):
         return {"seen": {}, "last_run": None}
     try:
@@ -111,13 +107,10 @@ def save_ledger(ledger: dict):
     with open(LEDGER_PATH, "w", encoding="utf-8") as f:
         json.dump(ledger, f, indent=2, ensure_ascii=False)
     print(f"     Ledger updated at {LEDGER_PATH} "
-          f"({len(ledger['seen'])} startups tracked total). "
-          "Remember: your workflow must git-commit this file for the "
-          "cross-run memory to persist.")
+          f"({len(ledger['seen'])} startups tracked total).")
 
 
 def parse_wait_time(error_str: str) -> float:
-    """Extracts a retry-after style wait time from provider error messages."""
     time_sec = 0.0
     m_match = re.search(r'(\d+)m', error_str)
     s_match = re.search(r'(\d+(?:\.\d+)?)s', error_str)
@@ -142,13 +135,9 @@ def _call_groq(model: str, prompt: str) -> str:
 
 
 def generate_with_fallback(prompt: str) -> str:
-    """Tries each (provider, model) in MODEL_CASCADE in order, remembering 
-    globally exhausted models to prevent loop-spam and redundant API hits.
-    """
     global EXHAUSTED_MODELS
     
     for provider, model in MODEL_CASCADE:
-        # Dynamically skip any model that has already thrown a TPD/Daily limit error
         if model in EXHAUSTED_MODELS:
             continue
             
@@ -164,9 +153,9 @@ def generate_with_fallback(prompt: str) -> str:
                     print(f"    [!] Payload too large for {provider}/{model}. Cascading...")
                     break
 
-                if "tpd" in error_str or "per day" in error_str or "resource_exhausted" in error_str and "day" in error_str:
+                if "tpd" in error_str or "per day" in error_str or ("resource_exhausted" in error_str and "day" in error_str):
                     print(f"    [!] Daily limits exhausted on {provider}/{model}. Blacklisting model globally...")
-                    EXHAUSTED_MODELS.add(model) # Lock the model out for the rest of the script run
+                    EXHAUSTED_MODELS.add(model)
                     break
 
                 if "429" in error_str or "rate" in error_str or "resource_exhausted" in error_str:
@@ -200,7 +189,7 @@ def with_retry(max_retries=3, delay=5):
     return decorator
 
 @with_retry(max_retries=3, delay=3)
-def search_tavily_general(query: str, start_date: str = None, search_depth: str = "advanced",  max_results: int = 3) -> str:
+def search_tavily_general(query: str, start_date: str = None, search_depth: str = "advanced", max_results: int = 3) -> str:
     params = {"query": query, "search_depth": search_depth, "max_results": max_results}
     if start_date:
         params["start_date"] = start_date
@@ -356,38 +345,105 @@ def format_links(links_array: list, label: str) -> str:
     return "<br>".join(f"<a href='{url}' target='_blank'>{label} {i+1}</a>" for i, url in enumerate(clean_links))
 
 
+def fetch_form_subscribers() -> list:
+    """Connects to Google Sheets via gspread and extracts unique subscriber emails and names."""
+    try:
+        # Check for service account json file
+        creds_file = "credentials.json"
+        if not os.path.exists(creds_file):
+            print(f"[-] Service account credentials file '{creds_file}' not found.")
+            return []
+
+        gc = gspread.service_account(filename=creds_file)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        worksheet = sh.get_worksheet(0)
+        records = worksheet.get_all_records()
+
+        subscribers = []
+        for row in records:
+            email = None
+            name = "Subscriber"
+
+            for key, val in row.items():
+                clean_key = str(key).strip().lower()
+                clean_val = str(val).strip()
+                if "email" in clean_key and clean_val:
+                    email = clean_val
+                elif "name" in clean_key and clean_val:
+                    name = clean_val
+
+            if email and re.match(r"[^@]+@[^@]+\.[^@]+", email):
+                subscribers.append({"email": email, "name": name})
+
+        unique_map = {item["email"].lower(): item for item in subscribers}
+        unique_subscribers = list(unique_map.values())
+
+        print(f"[+] Successfully loaded {len(unique_subscribers)} subscriber(s) from Google Sheet.")
+        return unique_subscribers
+
+    except Exception as e:
+        print(f"[-] Failed to fetch subscribers from Google Sheets: {e}")
+        return []
+
+
 def send_report(final_data: list):
     if not final_data:
         print("[*] Sourcing engine returned zero NEW early-stage entities for this window.")
         return
 
-    html = "<h2>Weekly Sourcing Report (Verified Early Stage Founders)</h2><table border='1' cellpadding='10' style='border-collapse: collapse;'>"
-    html += "<tr><th>Source Context</th><th>Startup</th><th>Founders</th><th>LinkedIn Profiles</th><th>X Handles</th></tr>"
+    subscribers = fetch_form_subscribers()
+
+    if not subscribers:
+        if RECEIVER_EMAIL:
+            print("[!] No subscribers found in Sheet. Falling back to default RECEIVER_EMAIL.")
+            subscribers = [{"email": RECEIVER_EMAIL, "name": "Subscriber"}]
+        else:
+            print("[-] CRITICAL EMAIL FAILURE: No recipient subscribers found.")
+            return
+
+    table_html = "<table border='1' cellpadding='10' style='border-collapse: collapse;'>"
+    table_html += "<tr><th>Source Context</th><th>Startup</th><th>Founders</th><th>LinkedIn Profiles</th><th>X Handles</th></tr>"
 
     for entry in final_data:
         names_list = entry.get("founder_names", [])
         founder_names_str = ", ".join(names_list) if names_list else "N/A"
-
         linkedin_html = format_links(entry.get("linkedin", []), "LinkedIn")
         x_html = format_links(entry.get("x_handle", []), "X Profile")
 
-        html += f"<tr><td>{entry['fund']}</td><td>{entry['startup']}</td><td>{founder_names_str}</td>"
-        html += f"<td>{linkedin_html}</td><td>{x_html}</td></tr>"
-    html += "</table>"
-    
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = "High-Signal Sourcing Pipeline: Early Stage Founders"
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = RECEIVER_EMAIL
-    msg.attach(MIMEText(html, "html"))
+        table_html += f"<tr><td>{entry['fund']}</td><td>{entry['startup']}</td><td>{founder_names_str}</td>"
+        table_html += f"<td>{linkedin_html}</td><td>{x_html}</td></tr>"
+    table_html += "</table>"
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
-        print("[+] Early-stage intelligence digest deployed successfully.")
-    except Exception as e:
-        print(f"\n[-] CRITICAL EMAIL FAILURE: {e}")
+    url = "https://api.brevo.com/v3/smtp/email"
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json"
+    }
+
+    for sub in subscribers:
+        recipient_email = sub["email"]
+        recipient_name = sub["name"]
+
+        full_html = f"<h2>Hi {recipient_name},</h2>"
+        full_html += "<p>Here is your Weekly Sourcing Report (Verified Early Stage Founders):</p>"
+        full_html += table_html
+
+        payload = {
+            "sender": {"name": "Sourcing Report", "email": SENDER_EMAIL},
+            "to": [{"email": recipient_email, "name": recipient_name}],
+            "subject": "High-Signal Sourcing Pipeline: Early Stage Founders",
+            "htmlContent": full_html
+        }
+
+        try:
+            response = requests.post(url, json=payload, headers=headers)
+            if response.status_code in (200, 201):
+                print(f"    [+] Brevo dispatched report to {recipient_name} ({recipient_email})")
+            else:
+                print(f"    [-] Brevo API error for {recipient_email}: {response.text}")
+        except Exception as e:
+            print(f"    [-] Failed to send to {recipient_email} via Brevo: {e}")
 
 def main():
     print(f"[*] Initializing Grounded Sourcing Pipeline. "
@@ -456,13 +512,12 @@ def main():
                 startup_record["founder_names"].append(founder_profile.get("founder_name", name))
                 startup_record["linkedin"].extend(founder_profile.get("linkedin", []))
                 startup_record["x_handle"].extend(founder_profile.get("x_handle", []))
-                time.sleep(4)  # keep LLM calls under Groq's free-tier RPM caps
+                time.sleep(4)
 
             compiled_intelligence.append(startup_record)
             save_state_to_json(compiled_intelligence)
             time.sleep(3)
 
-    # Update the cross-run ledger with everything reported this run.
     today_iso = datetime.now(timezone.utc).date().isoformat()
     for entry in compiled_intelligence:
         seen[entry["startup"].lower()] = today_iso
