@@ -266,11 +266,18 @@ def extract_startups(source_name: str, raw_text: str) -> list:
         return []
 
 def extract_founder_names(startup: str, fund: str) -> list:
-    primary_query = f'"{startup}" company founder'
+    fund_aliases = {
+        "Andreessen Horowitz": "Andreessen Horowitz OR a16z",
+        "South Park Commons": "South Park Commons OR SPC",
+        "Y Combinator": "Y Combinator OR YC"
+    }
+    fund_query_str = fund_aliases.get(fund, fund)
+
+    primary_query = f'"{startup}" ({fund_query_str}) founder'
     raw_intel = search_tavily_general(primary_query, search_depth="advanced", max_results=6)
 
     if not raw_intel or not raw_intel.strip():
-        fallback_query = f'"{startup}" startup funded "{fund}" founder co-founder'
+        fallback_query = f'"{startup}" startup funded ({fund_query_str}) founder co-founder'
         print(f"        [~] Primary founder search empty for '{startup}'. Retrying with fund context...")
         raw_intel = search_tavily_general(fallback_query, search_depth="advanced", max_results=6)
 
@@ -278,19 +285,33 @@ def extract_founder_names(startup: str, fund: str) -> list:
         return []
 
     prompt = f"""
-    Extract the names of the founders for the startup '{startup}'.
-    Return strictly a JSON object with a single key "founders" containing an array of strings (their names).
-    If no names are found, return {{"founders": []}}.
-    Data: {raw_intel}
+    Extract the names of the founders/co-founders/CEOs for the startup '{startup}'.
+    
+    CRITICAL RULES:
+    1. DO NOT extract partners, general partners, or founders of the venture capital firm '{fund}' itself (e.g., do NOT extract Peter Thiel, Marc Andreessen, Ben Horowitz, Sequoia partners, etc.).
+    2. Only extract individuals who are actual founders, co-founders, or C-level executives of the STARTUP '{startup}'.
+    3. Order the extracted names by executive role (e.g., CEO first, CTO second, Co-founders next).
+    
+    Return strictly a JSON object with a single key "founders" containing an ordered array of strings (their names).
+    If no actual startup founders are explicitly verified, return {{"founders": []}}.
+    Data: 
+    {raw_intel}
     """
     response_payload = generate_with_fallback(prompt)
     try:
         return clean_and_parse_json(response_payload).get("founders", [])
     except Exception:
         return []
+    
+    
+def is_valid_profile(url: str) -> bool:
+    """Validates if a URL is a personal LinkedIn profile. Blocks feeds, posts"""
+    pattern = r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[\w\-_%]+/?$"
+    return bool(re.match(pattern, url, re.IGNORECASE))
+
 
 def enrich_specific_founder(startup: str, founder_name: str) -> dict:
-    query = f'"{founder_name}" "{startup}" LinkedIn Twitter X profile'
+    query = f'"{founder_name}" "{startup}"'
     raw_intel = search_tavily_social(
         query,
         include_domains=["linkedin.com", "twitter.com", "x.com"],
@@ -303,14 +324,17 @@ def enrich_specific_founder(startup: str, founder_name: str) -> dict:
 
     prompt = f"""
     Parse this data to find the social profiles for '{founder_name}', founder of '{startup}'.
+    
+    CRITICAL IDENTITY RULE: You MUST verify that the startup '{startup}' is explicitly mentioned in the text surrounding the profile URL. 
+    If the snippet contains the '{startup}' name partially (e.g., if startup name is 'Banza App' and the snippet just says 'Banza'), you can accept it as a match. 
+    HOWEVER, if it has a completely different suffix or modifier (e.g., 'Banzas' or 'Banza Cab'), it is a homonym and you MUST ignore it.
+    
     Return strictly a JSON object with exactly these keys:
     "founder_name": "{founder_name}",
     "linkedin": [Array of strings containing their actual LinkedIn URLs from the data],
     "x_handle": [Array of strings containing their actual X/Twitter profile URLs]
 
-    Only include a URL if the surrounding text in the data ties it to '{founder_name}' specifically —
-    do not include profiles belonging to other people who share a similar name.
-    If valid profile URLs are missing, return empty arrays [].
+    If valid profile URLs are missing or the strict identity rule fails, return empty arrays [].
     Material:
     {raw_intel}
     """
@@ -441,7 +465,7 @@ def send_report(final_data: list):
 
     cache_latest_report_in_sheet(table_html)
 
-    url = "[https://api.brevo.com/v3/smtp/email](https://api.brevo.com/v3/smtp/email)"
+    url = "https://api.brevo.com/v3/smtp/email"
     headers = {
         "accept": "application/json",
         "api-key": BREVO_API_KEY,
@@ -534,12 +558,29 @@ def main():
                 "x_handle": [],
             }
 
+            verified_count = 0
+
             for name in founder_names:
+                if verified_count >= 3:
+                    print(f"        [+] Successfully verified 3 founders for {startup}. Moving on")
+                    break
+                    
                 print(f"        [+] Extracting targeted URLs for {name}...")
                 founder_profile = enrich_specific_founder(startup, name)
-                startup_record["founder_names"].append(founder_profile.get("founder_name", name))
-                startup_record["linkedin"].extend(founder_profile.get("linkedin", []))
-                startup_record["x_handle"].extend(founder_profile.get("x_handle", []))
+                
+                valid_linkedins = [
+                    link for link in founder_profile.get("linkedin", []) 
+                    if is_valid_profile(link)
+                ]
+                
+                if valid_linkedins:
+                    startup_record["founder_names"].append(founder_profile.get("founder_name", name))
+                    startup_record["linkedin"].extend(valid_linkedins)
+                    startup_record["x_handle"].extend(founder_profile.get("x_handle", []))
+                    verified_count += 1
+                else:
+                    print(f"        [-] Rejected: No valid or strictly matched LinkedIn profile for {name}.")
+                    
                 time.sleep(4)
 
             compiled_intelligence.append(startup_record)
