@@ -58,6 +58,7 @@ LEDGER_PATH = os.path.join(STATE_DIR, "seen_startups.json")
 REPORT_PATH = "sourcing_report.json"
 
 MODEL_CASCADE = [
+    ("groq", "groq/compound"),
     ("groq", "llama-3.3-70b-versatile"),
     ("groq", "openai/gpt-oss-120b"),
     ("groq", "meta-llama/llama-4-scout-17b-16e-instruct"),
