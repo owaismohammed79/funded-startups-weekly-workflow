@@ -38,6 +38,8 @@ jobs:
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
         run: python script.py
 
       - name: Delete Service Account Key
