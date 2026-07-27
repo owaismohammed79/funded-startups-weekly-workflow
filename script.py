@@ -51,7 +51,7 @@ FUNDS_TO_TRACK = [
 
 FUNDING_WINDOW_DAYS = 270
 EXHAUSTED_MODELS = set()
-MAX_NEW_STARTUPS_PER_RUN = 20
+MAX_NEW_STARTUPS_PER_RUN = 10
 
 STATE_DIR = "data/state"
 LEDGER_PATH = os.path.join(STATE_DIR, "seen_startups.json")
@@ -325,16 +325,16 @@ def enrich_specific_founder(startup: str, founder_name: str) -> dict:
     prompt = f"""
     Parse this data to find the social profiles for '{founder_name}', founder of '{startup}'.
     
-    CRITICAL IDENTITY RULE: You MUST verify that the startup '{startup}' is explicitly mentioned in the text surrounding the profile URL. 
-    If the snippet contains the '{startup}' name partially (e.g., if startup name is 'Banza App' and the snippet just says 'Banza'), you can accept it as a match. 
-    HOWEVER, if it has a completely different suffix or modifier (e.g., 'Banzas' or 'Banza Cab'), it is a homonym and you MUST ignore it.
-    
     Return strictly a JSON object with exactly these keys:
     "founder_name": "{founder_name}",
     "linkedin": [Array of strings containing their actual LinkedIn URLs from the data],
     "x_handle": [Array of strings containing their actual X/Twitter profile URLs]
 
-    If valid profile URLs are missing or the strict identity rule fails, return empty arrays [].
+    MATCHING RULES:
+    1. The profile MUST belong to '{founder_name}'.
+    2. Look for mentions of '{startup}' OR contextual clues like "Founder", "Stealth", or the VC fund in the snippet. Do not reject a profile just because the startup name is truncated in the text snippet, provided it is highly probable it is the same person.
+    3. If valid profile URLs are missing or it is clearly the wrong person, return empty arrays [].
+    
     Material:
     {raw_intel}
     """
@@ -523,8 +523,10 @@ def main():
         startups = extract_startups(fund, raw_news)
         print(f"    Verified Early Stage Startups: {startups}")
 
-        for index, startup in enumerate(startups):
-            if len(compiled_intelligence) >= MAX_NEW_STARTUPS_PER_RUN or index >= 3:
+        fund_processed_count = 0
+
+        for startup in startups:
+            if len(compiled_intelligence) >= MAX_NEW_STARTUPS_PER_RUN or fund_processed_count >= 3:
                 break
 
             key = startup.lower()
@@ -549,6 +551,8 @@ def main():
                 })
                 save_state_to_json(compiled_intelligence)
                 continue
+
+            fund_processed_count += 1
 
             startup_record = {
                 "fund": fund,
