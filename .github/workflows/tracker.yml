@@ -40,6 +40,8 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          DEV_TO_API_KEY: ${{ secrets.DEV_TO_API_KEY }}
+          DEV_TO_ORG_ID: ${{ secrets.DEV_TO_ORG_ID }}
         run: python script.py
 
       - name: Delete Service Account Key

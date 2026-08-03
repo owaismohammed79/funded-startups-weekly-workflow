@@ -21,6 +21,8 @@ BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
+DEV_TO_API_KEY = os.environ.get("DEV_TO_API_KEY")
+DEV_TO_ORG_ID = os.environ.get("DEV_TO_ORG_ID")
 
 REQUIRED_ENV_VARS = {
     "TAVILY_API_KEY": TAVILY_API_KEY,
@@ -303,8 +305,7 @@ def extract_founder_names(startup: str, fund: str) -> list:
         return clean_and_parse_json(response_payload).get("founders", [])
     except Exception:
         return []
-    
-    
+
 def is_valid_profile(url: str) -> bool:
     """Validates if a URL is a personal LinkedIn profile. Blocks feeds, posts"""
     pattern = r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[\w\-_%]+/?$"
@@ -367,6 +368,85 @@ def format_links(links_array: list, label: str) -> str:
     if not clean_links:
         return "N/A"
     return "<br>".join(f"<a href='{url}' target='_blank'>{label} {i+1}</a>" for i, url in enumerate(clean_links))
+
+
+def format_links_markdown(links_array: list, label: str) -> str:
+    """Formats links cleanly for Markdown tables"""
+    if not links_array or not isinstance(links_array, list):
+        return "N/A"
+    clean_links = []
+    toxic_patterns = ["/search", "?q=", "/hashtag/", "/status/", "/posts/"]
+
+    for link in links_array:
+        if link and isinstance(link, str):
+            link = link.strip()
+            if any(toxic in link.lower() for toxic in toxic_patterns):
+                continue
+            if link not in ["", "#", "N/A", "Not Found"] and link.startswith("http"):
+                clean_links.append(link)
+
+    if not clean_links:
+        return "N/A"
+    return " <br> ".join(f"[{label} {i+1}]({url})" for i, url in enumerate(clean_links))
+
+
+def generate_markdown_report(final_data: list) -> str:
+    """Converts the extracted data into Markdown table."""
+    md = "### Autonomous OSINT Intelligence Report\n\n"
+    md += "Here are the verified early-stage startup founders extracted by our autonomous AI pipeline this week.\n\n"
+    md += "| Source Context | Startup | Founders | LinkedIn Profiles | X Handles |\n"
+    md += "| :--- | :--- | :--- | :--- | :--- |\n"
+
+    for entry in final_data:
+        names_list = entry.get("founder_names", [])
+        founder_names_str = ", ".join(names_list) if names_list else "N/A"
+        linkedin_md = format_links_markdown(entry.get("linkedin", []), "LinkedIn")
+        x_md = format_links_markdown(entry.get("x_handle", []), "X Profile")
+
+        fund = entry.get("fund", "N/A")
+        startup = entry.get("startup", "N/A")
+
+        md += f"| {fund} | {startup} | {founder_names_str} | {linkedin_md} | {x_md} |\n"
+
+    md += "\n---\n*Automated weekly intelligence report powered by Groq, Tavily, and GitHub Actions.*"
+    return md
+
+
+def publish_to_devto(title: str, markdown_content: str):
+    if not DEV_TO_API_KEY:
+        print("    [-] DEV_TO_API_KEY missing. Skipping DEV.to publish.")
+        return None
+
+    url = "https://dev.to/api/articles"
+    headers = {
+        "api-key": DEV_TO_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "article": {
+            "title": title,
+            "published": True,
+            "body_markdown": markdown_content,
+            "tags": ["startups", "ai", "opensource"],
+        }
+    }
+
+    # Directs post to your free DEV.to Organization if provided
+    if DEV_TO_ORG_ID:
+        payload["article"]["organization_id"] = int(DEV_TO_ORG_ID)
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        if response.status_code in (200, 201):
+            post_url = response.json().get("url")
+            print(f"    [+] Successfully published to DEV.to! Live at: {post_url}")
+            return post_url
+        else:
+            print(f"    [-] DEV.to API Error: {response.text}")
+    except Exception as e:
+        print(f"    [-] Network error publishing to DEV.to: {e}")
+    return None
 
 
 def fetch_form_subscribers() -> list:
@@ -598,6 +678,15 @@ def main():
     save_ledger(ledger)
 
     send_report(compiled_intelligence)
+
+    if compiled_intelligence:
+        today_formatted = datetime.now(timezone.utc).strftime("%b %d, %Y")
+        report_title = f"Weekly Startup Intel: YC & a16z Sourcing Drop ({today_formatted})"
+        markdown_body = generate_markdown_report(compiled_intelligence)
+        
+        print("\n[*] Publishing weekly intelligence report to Hashnode...")
+        publish_to_hashnode(report_title, markdown_body)
+
     print(f"\n[+] Target pipeline run finalized. {len(compiled_intelligence)} new startup(s) reported.")
 
 
