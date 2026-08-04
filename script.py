@@ -275,23 +275,23 @@ def extract_founder_names(startup: str, fund: str) -> list:
         "Y Combinator": "Y Combinator OR YC"
     }
     fund_query_str = fund_aliases.get(fund, fund)
+    clean_startup = re.sub(r'\b(App|AI|Solutions|Inc|Corp|Technologies|Labs)\b', '', startup, flags=re.IGNORECASE).strip()
 
     primary_query = f'"{startup}" ({fund_query_str}) founder'
     raw_intel = search_tavily_general(primary_query, search_depth="advanced", max_results=6)
 
     if not raw_intel or not raw_intel.strip():
-        fallback_query = f'"{startup}" startup funded ({fund_query_str}) founder co-founder'
-        print(f"        [~] Primary founder search empty for '{startup}'. Retrying with fund context...")
+        fallback_query = f'"{clean_startup}" startup ({fund_query_str}) founder co-founder'
         raw_intel = search_tavily_general(fallback_query, search_depth="advanced", max_results=6)
 
-    if not raw_intel:
+    if not raw_intel or not raw_intel.strip():
         return []
 
     prompt = f"""
     Extract the names of the founders/co-founders/CEOs for the startup '{startup}'.
     
     CRITICAL RULES:
-    1. DO NOT extract partners, general partners, or founders of the venture capital firm '{fund}' itself (e.g., do NOT extract Peter Thiel, Marc Andreessen, Ben Horowitz, Sequoia partners, etc.).
+    1. DO NOT extract partners, general partners, or founders of the venture capital firm '{fund}' itself.
     2. Only extract individuals who are actual founders, co-founders, or C-level executives of the STARTUP '{startup}'.
     3. Order the extracted names by executive role (e.g., CEO first, CTO second, Co-founders next).
     
@@ -328,14 +328,20 @@ def enrich_specific_founder(startup: str, founder_name: str) -> dict:
     Parse this data to find the social profiles for '{founder_name}', founder of '{startup}'.
     
     Return strictly a JSON object with exactly these keys:
-    "founder_name": "{founder_name}",
-    "linkedin": [Array of strings containing their actual LinkedIn URLs from the data],
-    "x_handle": [Array of strings containing their actual X/Twitter profile URLs]
+    {{
+        "founder_name": "{founder_name}",
+        "linkedin": [Array of strings containing valid personal LinkedIn profile URLs],
+        "x_handle": [Array of strings containing valid personal X/Twitter profile URLs]
+    }}
 
-    MATCHING RULES:
+    STRICT HOMONYM & BRAND-MATCHING RULES:
     1. The profile MUST belong to '{founder_name}'.
-    2. Look for mentions of '{startup}' OR contextual clues like "Founder", "Stealth", or the VC fund in the snippet. Do not reject a profile just because the startup name is truncated in the text snippet, provided it is highly probable it is the same person.
-    3. If valid profile URLs are missing or it is clearly the wrong person, return empty arrays [].
+    2. COMPANY NAME MATCHING:
+       - You MUST verify that the startup name '{startup}' (or its core brand root if '{startup}' contains generic words like 'App', 'AI', 'Inc', 'Solutions') is explicitly mentioned in the text surrounding the profile URL.
+       - PARTIAL ROOT ALLOWED: If the startup name is 'Banza App', matching 'Banza' in the bio/snippet IS valid.
+       - REJECT HOMONYMS: If the snippet matches a modified company name (e.g., 'Banzas', 'Banza Cab', 'Banza Logistics'), it is a homonym and you MUST ignore and drop that profile URL.
+    3. EXCLUDE POSTS & SEARCH PAGES: Drop any links containing '/posts/', '/status/', '/hashtag/', or '/search'. Only accept actual user profile URLs ('/in/' for LinkedIn).
+    4. If no valid profile meets these exact rules, return empty arrays [].
     
     Material:
     {raw_intel}
