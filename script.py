@@ -691,7 +691,7 @@ def main():
         markdown_body = generate_markdown_report(compiled_intelligence)
         
         print("\n[*] Publishing weekly intelligence report to Hashnode...")
-        publish_to_hashnode(report_title, markdown_body)
+        publish_to_devto(report_title, markdown_body)
 
     print(f"\n[+] Target pipeline run finalized. {len(compiled_intelligence)} new startup(s) reported.")
 
