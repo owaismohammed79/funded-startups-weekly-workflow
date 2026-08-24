@@ -42,6 +42,7 @@ jobs:
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           DEV_TO_API_KEY: ${{ secrets.DEV_TO_API_KEY }}
           DEV_TO_ORG_ID: ${{ secrets.DEV_TO_ORG_ID }}
+          YC_OSS_URL: ${{ secrets. YCC_OSS_URL }}
         run: python script.py
 
       - name: Delete Service Account Key
